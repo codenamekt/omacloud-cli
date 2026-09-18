@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""OmaCloud CLI tool.
+
+Connects to OmaCloud Control Plane API, manages authentication,
+launches ephemeral Omarchy desktops, and runs automated PR verifications.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+CONFIG_DIR = Path.home() / ".config" / "omacloud"
+AUTH_FILE = CONFIG_DIR / "auth.json"
+API_BASE_URL = os.environ.get("OMACLOUD_API_URL", "http://127.0.0.1:8080/v1")
+
+
+def get_stored_token() -> Optional[str]:
+    """Read API token from ~/.config/omacloud/auth.json."""
+    if not AUTH_FILE.is_file():
+        return None
+    try:
+        data = json.loads(AUTH_FILE.read_text())
+        return data.get("api_token")
+    except Exception:
+        return None
+
+
+def save_stored_auth(api_token: str, email: str, tier: str) -> None:
+    """Save API token and user info to ~/.config/omacloud/auth.json."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "api_token": api_token,
+        "email": email,
+        "tier": tier,
+        "saved_at": time.time(),
+    }
+    AUTH_FILE.write_text(json.dumps(payload, indent=2) + "\n")
+    os.chmod(AUTH_FILE, 0o600)
+
+
+def api_request(
+    path: str,
+    method: str = "GET",
+    data: Optional[Dict[str, Any]] = None,
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute HTTP request against the OmaCloud Control Plane API."""
+    url = f"{API_BASE_URL}{path}"
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        try:
+            err_json = json.loads(error_body)
+            detail = err_json.get("detail", error_body)
+        except Exception:
+            detail = error_body
+        print(f"\033[1;31mError ({e.code}):\033[0m {detail}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"\033[1;31mConnection Error:\033[0m Could not connect to OmaCloud API at {url} ({e.reason})", file=sys.stderr)
+        sys.exit(1)
+
+
+# ------------------------------------------------------------- Commands
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    """Tailscale-style device authentication."""
+    import socket
+
+    hostname = socket.gethostname()
+    print(f"\033[1;34m==>\033[0m Requesting device authentication for \033[1m{hostname}\033[0m...")
+
+    res = api_request("/auth/cli/request", method="POST", data={"hostname": hostname})
+    session_id = res["session_id"]
+    client_secret = res["client_secret"]
+    auth_url = res["auth_url"]
+    poll_interval = res.get("poll_interval_seconds", 2)
+
+    print(f"\n\033[1mTo complete login, open the following URL in your browser:\033[0m\n")
+    print(f"    \033[1;36m{auth_url}\033[0m\n")
+
+    # Try opening the browser automatically
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    print("Waiting for web authorization...", end="", flush=True)
+
+    while True:
+        time.sleep(poll_interval)
+        print(".", end="", flush=True)
+
+        poll_res = api_request(f"/auth/cli/poll?session_id={session_id}&client_secret={client_secret}")
+        status = poll_res.get("status")
+
+        if status == "approved":
+            token = poll_res["api_token"]
+            email = poll_res.get("user_email", "user@omacloud.org")
+            tier = poll_res.get("user_tier", "free")
+            save_stored_auth(token, email, tier)
+            print(f"\n\n\033[1;32m✓ Successfully authenticated as {email} ({tier.upper()} Tier)\033[0m")
+            print(f"Credentials saved to {AUTH_FILE}")
+            return
+        elif status in ("rejected", "expired"):
+            print(f"\n\n\033[1;31mAuthentication {status}. Please try running 'omacloud login' again.\033[0m")
+            sys.exit(1)
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    """Provision and launch an ephemeral desktop session."""
+    token = get_stored_token()
+    if not token:
+        print("\033[1;33mNot authenticated.\033[0m Please run 'omacloud login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\033[1;34m==>\033[0m Launching ephemeral Omarchy desktop ({args.substrate} substrate)...")
+
+    payload = {
+        "name": args.name or "omarchy-desktop",
+        "substrate": args.substrate,
+        "profile": args.profile,
+    }
+
+    res = api_request("/sessions", method="POST", data=payload, auth_token=token)
+
+    web_url = res["streaming"]["web_url"]
+    vnc_ep = res["streaming"]["vnc_endpoint"]
+    audio_ep = res["streaming"]["audio_endpoint"]
+    sess_id = res["id"]
+
+    print(f"\n\033[1;32m✓ Desktop session ready!\033[0m")
+    print(f"  • \033[1mSession ID:\033[0m {sess_id}")
+    print(f"  • \033[1mStatus:\033[0m     {res['status'].upper()}")
+    print(f"  • \033[1mSubstrate:\033[0m  {res['substrate']}")
+    print(f"  • \033[1mWeb URL:\033[0m    \033[1;36m{web_url}\033[0m")
+    print(f"  • \033[1mVNC Direct:\033[0m {vnc_ep}")
+    print(f"  • \033[1mAudio MP3:\033[0m  {audio_ep}")
+
+    if not args.no_browser:
+        print(f"\nOpening browser to desktop...")
+        try:
+            webbrowser.open(web_url)
+        except Exception:
+            pass
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """List active desktop sessions and account quota."""
+    token = get_stored_token()
+    if not token:
+        print("\033[1;33mNot authenticated.\033[0m Please run 'omacloud login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    profile = api_request("/user/me", auth_token=token)
+    sessions = api_request("/sessions", auth_token=token)
+
+    print(f"\033[1;34m==> Account:\033[0m \033[1m{profile['email']}\033[0m | Tier: \033[1;32m{profile['tier'].upper()}\033[0m")
+    daily_m = profile["daily_usage_seconds"] // 60
+    rem_m = profile["remaining_daily_seconds"] // 60
+    print(f"    Daily Usage: {daily_m}m used · {rem_m}m remaining today\n")
+
+    if not sessions:
+        print("No active desktop sessions. Run 'omacloud up' to start one.")
+        return
+
+    print(f"{'SESSION ID':<28} {'NAME':<20} {'SUBSTRATE':<10} {'STATUS':<10} {'UPTIME':<10} {'REMAINING':<10}")
+    print("─" * 90)
+    for s in sessions:
+        uptime_m = s["uptime_seconds"] // 60
+        rem_m = s["remaining_seconds"] // 60
+        print(f"{s['id']:<28} {s['name']:<20} {s['substrate']:<10} {s['status']:<10} {uptime_m}m{'':<7} {rem_m}m")
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    """Terminate and tear down a desktop session."""
+    token = get_stored_token()
+    if not token:
+        print("\033[1;33mNot authenticated.\033[0m Please run 'omacloud login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    session_id = args.session_id
+    if not session_id:
+        sessions = api_request("/sessions", auth_token=token)
+        if not sessions:
+            print("No active sessions found.")
+            return
+        session_id = sessions[0]["id"]
+
+    print(f"\033[1;34m==>\033[0m Terminating session \033[1m{session_id}\033[0m...")
+    res = api_request(f"/sessions/{session_id}", method="DELETE", auth_token=token)
+    print(f"\033[1;32m✓ {res.get('message', 'Session terminated.')}\033[0m")
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Inspect or run automated PR verification."""
+    pr_num = args.pr
+    pr_id = f"pr-{pr_num}"
+
+    print(f"\033[1;34m==>\033[0m Fetching verification results for \033[1mPR #{pr_num}\033[0m...")
+    res = api_request(f"/verifications/{pr_id}")
+
+    target = res.get("target", {})
+    tap = res.get("tap", {})
+    status = res.get("status", "unknown")
+    verdict = res.get("verification", {}).get("verdict", "")
+
+    badge = "\033[1;32m✅ PASSED\033[0m" if status == "passed" else "\033[1;33m⚠️ CHANGES REQUESTED\033[0m" if status == "changes-requested" else f"\033[1;34m{status.upper()}\033[0m"
+
+    print(f"\n{badge} — {res.get('reason', '')}")
+    print(f"  • \033[1mPR:\033[0m           #{target.get('pr')} — {target.get('title')}")
+    print(f"  • \033[1mAuthor:\033[0m       @{target.get('author')}")
+    print(f"  • \033[1mScope:\033[0m        {verdict}")
+    print(f"  • \033[1mTAP Results:\033[0m  {tap.get('passed', 0)} passed · {tap.get('failed', 0)} failed · {tap.get('skipped', 0)} skipped")
+    print(f"  • \033[1mDuration:\033[0m     {res.get('duration_s', 0):.1f}s")
+
+    integrity = res.get("integrity", {})
+    findings = integrity.get("findings", [])
+    if findings:
+        print(f"\n\033[1;33m🔍 Diagnostic & Integrity Findings ({len(findings)}):\033[0m")
+        for f in findings:
+            kind = f.get("kind")
+            msg = f.get("message")
+            print(f"  • \033[1m{kind}:\033[0m {msg}")
+
+    ai_reviews = integrity.get("ai_visual_review", [])
+    if ai_reviews:
+        print(f"\n\033[1;36m🤖 AI Visual Review Summary:\033[0m")
+        for rev in ai_reviews:
+            status_text = "\033[1;32mPASSED\033[0m" if rev.get("state_matches_intent") else "\033[1;31mREGRESSION\033[0m"
+            print(f"  • {rev.get('image_name')}: {status_text} — {rev.get('elements_observed')}")
+
+    print(f"\n\033[1mFull Report Link:\033[0m {API_BASE_URL}/verifications/{pr_id}/report")
+
+
+# ------------------------------------------------------------- Entrypoint
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="omacloud",
+        description="OmaCloud CLI — Launch ephemeral Omarchy desktops and verify PRs.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # Login
+    p_login = sub.add_parser("login", help="Authenticate with OmaCloud via browser")
+    p_login.set_defaults(func=cmd_login)
+
+    # Up
+    p_up = sub.add_parser("up", help="Launch an ephemeral Omarchy desktop")
+    p_up.add_argument("--name", help="Custom session name")
+    p_up.add_argument("--substrate", choices=["docker", "qemu"], default="docker", help="Execution substrate")
+    p_up.add_argument("--profile", default="omarchy-quattro", help="Desktop profile")
+    p_up.add_argument("--no-browser", action="store_true", help="Do not automatically open browser")
+    p_up.set_defaults(func=cmd_up)
+
+    # Status
+    p_status = sub.add_parser("status", help="List running sessions and quota")
+    p_status.set_defaults(func=cmd_status)
+
+    # Down
+    p_down = sub.add_parser("down", help="Stop and terminate a desktop session")
+    p_down.add_argument("session_id", nargs="?", help="Session ID to terminate")
+    p_down.set_defaults(func=cmd_down)
+
+    # Verify
+    p_verify = sub.add_parser("verify", help="Inspect automated PR verification results")
+    p_verify.add_argument("--pr", type=int, required=True, help="PR number to inspect")
+    p_verify.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
