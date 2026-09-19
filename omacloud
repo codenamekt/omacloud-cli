@@ -8,11 +8,14 @@ launches ephemeral Omarchy desktops, and runs automated PR verifications.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -66,6 +69,9 @@ def api_request(
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            print("\033[1;31mRate-limited, retry in 60s.\033[0m", file=sys.stderr)
+            sys.exit(1)
         error_body = e.read().decode("utf-8")
         try:
             err_json = json.loads(error_body)
@@ -80,6 +86,107 @@ def api_request(
 
 
 # ------------------------------------------------------------- Commands
+
+
+def cmd_signup(args: argparse.Namespace) -> None:
+    """Sign up for a free OmaCloud account via magic link and localhost callback."""
+    email = args.email
+    if not email:
+        try:
+            email = input("Email address: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            sys.exit(1)
+
+    if not email:
+        print("\033[1;31mError:\033[0m Email address is required.", file=sys.stderr)
+        sys.exit(1)
+
+    # Start temporary callback server on port 8765
+    callback_received = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # Suppress HTTP logging
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/callback":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                html = (
+                    "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Authenticated</title></head>"
+                    "<body style='background:#1e1e2e;color:#cdd6f4;font-family:sans-serif;text-align:center;padding:50px;'>"
+                    "<h2 style='color:#a6e3a1;'>✓ Authenticated!</h2>"
+                    "<p style='color:#a6adc8;'>You can close this tab and return to your terminal.</p>"
+                    "</body></html>"
+                )
+                self.wfile.write(html.encode("utf-8"))
+                callback_received.set()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    httpd = None
+    try:
+        httpd = http.server.HTTPServer(("127.0.0.1", 8765), CallbackHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+    except OSError:
+        httpd = None
+
+    print(f"Sending magic link to {email}…")
+
+    res = api_request("/auth/signup", method="POST", data={"email": email, "intent": "free"})
+    signup_id = res["signup_id"]
+    magic_link_url = res.get("magic_link_url")
+
+    callback_url = f"http://127.0.0.1:8765/callback?signup={signup_id}"
+
+    print(f"\nOpen this URL in your browser to complete sign-up:\n")
+    print(f"  \033[1;36m{callback_url}\033[0m\n")
+    print("(We started a temporary callback server on port 8765 so the browser")
+    print(" hands control back to this terminal when you click the email link.)\n")
+    print("Waiting…", end="", flush=True)
+
+    # Attempt to open browser pointing to magic link URL or callback URL
+    if magic_link_url:
+        try:
+            webbrowser.open(magic_link_url)
+        except Exception:
+            pass
+
+    poll_start = time.time()
+    poll_timeout = 900  # 15 minutes TTL
+    poll_interval = 2
+
+    try:
+        while time.time() - poll_start < poll_timeout:
+            time.sleep(poll_interval)
+            print(".", end="", flush=True)
+
+            poll_res = api_request(f"/auth/signup/poll/{signup_id}")
+            status = poll_res.get("status")
+
+            if status == "ok":
+                token = poll_res["api_token"]
+                user_email = poll_res.get("email", email)
+                tier = poll_res.get("tier", "free")
+                save_stored_auth(token, user_email, tier)
+                print(f"\n\n\033[1;32m✓ Signed in as {user_email} ({tier} tier)\033[0m")
+                print("Run `omacloud up` to launch your desktop.")
+                return
+            elif status == "expired":
+                print("\n\n\033[1;31mMagic link expired, run 'omacloud signup' again.\033[0m")
+                sys.exit(1)
+
+        print("\n\n\033[1;31mMagic link expired, run 'omacloud signup' again.\033[0m")
+        sys.exit(1)
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 def cmd_login(args: argparse.Namespace) -> None:
@@ -244,7 +351,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     ai_reviews = integrity.get("ai_visual_review", [])
     if ai_reviews:
-        print(f"\n\033[1;36m🤖 AI Visual Review Summary:\033[0m")
+        print(f"\n\033[1;36m👁️ AI Visual Review Summary:\033[0m")
         for rev in ai_reviews:
             status_text = "\033[1;32mPASSED\033[0m" if rev.get("state_matches_intent") else "\033[1;31mREGRESSION\033[0m"
             print(f"  • {rev.get('image_name')}: {status_text} — {rev.get('elements_observed')}")
@@ -261,6 +368,11 @@ def main() -> None:
         description="OmaCloud CLI — Launch ephemeral Omarchy desktops and verify PRs.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # Signup
+    p_signup = sub.add_parser("signup", help="Sign up for a free OmaCloud account via magic link")
+    p_signup.add_argument("--email", help="Email address to sign up with")
+    p_signup.set_defaults(func=cmd_signup)
 
     # Login
     p_login = sub.add_parser("login", help="Authenticate with OmaCloud via browser")
