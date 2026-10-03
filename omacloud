@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 
 CONFIG_DIR = Path.home() / ".config" / "omacloud"
 AUTH_FILE = CONFIG_DIR / "auth.json"
-API_BASE_URL = os.environ.get("OMACLOUD_API_URL", "https://app.omacloud.org/v1")
+API_BASE_URL = os.environ.get("OMACLOUD_API_URL", "https://api.omacloud.org/v1")
 
 
 def get_stored_token() -> Optional[str]:
