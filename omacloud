@@ -271,6 +271,34 @@ def cmd_up(args: argparse.Namespace) -> None:
             pass
 
 
+def cmd_logout(args: argparse.Namespace) -> None:
+    """Remove the locally stored API token (logout from the CLI).
+
+    Client-side only: deletes ~/.config/omacloud/auth.json. The token itself
+    remains valid server-side until expiry; a future server-side /v1/auth/revoke
+    endpoint could invalidate it. This is sufficient for switching accounts
+    or clearing local state before `omacloud login` runs again.
+    """
+    if not AUTH_FILE.is_file():
+        print("Not currently logged in (no auth.json at ~/.config/omacloud/auth.json).")
+        return
+    # Best-effort: peek at the file so we can say goodbye to the right email.
+    email = ""
+    try:
+        email = (json.loads(AUTH_FILE.read_text()) or {}).get("email", "") or ""
+    except Exception:
+        pass
+    try:
+        AUTH_FILE.unlink()
+    except OSError as e:
+        print(f"\033[1;31mError:\033[0m Could not delete {AUTH_FILE}: {e}", file=sys.stderr)
+        sys.exit(1)
+    msg = "✓ Logged out"
+    if email and "@" in email:
+        msg += f" ({email})"
+    print(msg)
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """List active desktop sessions and account quota."""
     token = get_stored_token()
@@ -399,6 +427,10 @@ def main() -> None:
     p_verify = sub.add_parser("verify", help="Inspect automated PR verification results")
     p_verify.add_argument("--pr", type=int, required=True, help="PR number to inspect")
     p_verify.set_defaults(func=cmd_verify)
+
+    # Logout
+    p_logout = sub.add_parser("logout", help="Remove stored credentials (local logout)")
+    p_logout.set_defaults(func=cmd_logout)
 
     args = parser.parse_args()
     args.func(args)
