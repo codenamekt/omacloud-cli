@@ -346,6 +346,132 @@ def cmd_down(args: argparse.Namespace) -> None:
     print(f"\033[1;32m✓ {res.get('message', 'Session terminated.')}\033[0m")
 
 
+def _resolve_session(args: argparse.Namespace, token: str, require_running: bool = True) -> Dict[str, Any]:
+    """Pick the session to operate on: an explicit ID, else the most-recent.
+
+    `require_running=True` filters out TERMINATED / STOPPED rows so `open`
+    doesn't try to launch a browser at a dead session.
+    """
+    session_id = getattr(args, "session_id", None)
+    sessions = api_request("/sessions", auth_token=token)
+    if session_id:
+        match = next((s for s in sessions if s["id"] == session_id), None)
+        if not match:
+            print(f"\033[1;31mError:\033[0m No session with id \033[1m{session_id}\033[0m found.", file=sys.stderr)
+            sys.exit(1)
+        sess = match
+    else:
+        if not sessions:
+            print("No active sessions. Run \033[1momacloud up\033[0m to start one.", file=sys.stderr)
+            sys.exit(1)
+        if require_running:
+            running = [s for s in sessions if s["status"] == "RUNNING"]
+            if not running:
+                print(
+                    f"No running sessions (most recent is {sessions[0]['status']}). "
+                    "Pass an explicit session ID to inspect a non-running session.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            sess = running[0]
+        else:
+            sess = sessions[0]
+    # Always fetch the live record — /v1/sessions is a list endpoint and the
+    # GET /v1/sessions/{id} handler returns the full streaming payload.
+    return api_request(f"/sessions/{sess['id']}", auth_token=token)
+
+
+def cmd_open(args: argparse.Namespace) -> None:
+    """Open the noVNC viewer for an existing session in the system browser.
+
+    `omacloud open` re-launches the browser pointed at the session's web_url.
+    Useful when the original `omacloud up` browser was closed, or to re-open
+    a session that was created on another machine. Picks the most-recent
+    running session by default; pass an explicit session ID to target a
+    specific one (including STOPPED/TERMINATED for forensics).
+    """
+    token = get_stored_token()
+    if not token:
+        print("\033[1;33mNot authenticated.\033[0m Please run 'omacloud login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    sess = _resolve_session(args, token, require_running=True)
+    web_url = sess["streaming"]["web_url"]
+    sess_id = sess["id"]
+
+    print(f"\033[1;34m==>\033[0m Opening browser for session \033[1m{sess_id}\033[0m ({sess['status']})...")
+    print(f"  \033[1mWeb URL:\033[0m \033[1;36m{web_url}\033[0m")
+
+    if args.print_only:
+        # Print URL only — useful in scripts/CI where opening a browser
+        # would hang or fail.
+        return
+
+    try:
+        webbrowser.open(web_url)
+    except Exception as e:
+        print(f"\033[1;31mFailed to open browser:\033[0m {e}", file=sys.stderr)
+        print(f"Open this URL manually: {web_url}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    """Show duration accounting and lifecycle timestamps for a session.
+
+    Without an API-side log streaming endpoint this surfaces the session
+    lifecycle fields (`created_at`, `started_at`, `uptime_seconds`,
+    `remaining_seconds`, `max_duration_seconds`) plus the user's daily
+    quota usage so the operator can see exactly how much of the
+    2-hour hard trial limit and the daily quota the session has consumed.
+    """
+    token = get_stored_token()
+    if not token:
+        print("\033[1;33mNot authenticated.\033[0m Please run 'omacloud login' first.", file=sys.stderr)
+        sys.exit(1)
+
+    sess = _resolve_session(args, token, require_running=False)
+    profile = api_request("/user/me", auth_token=token)
+
+    sess_id = sess["id"]
+    name = sess["name"]
+    status = sess["status"]
+    substrate = sess["substrate"]
+    profile_name = sess["profile"]
+
+    def fmt_ts(value: Optional[str]) -> str:
+        if not value:
+            return "—"
+        # API returns ISO-8601 with timezone offset (e.g. 2026-10-04T15:30:00+00:00).
+        # Render the same value the user sees in dashboard logs.
+        return value
+
+    def fmt_duration(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h{m:02d}m{s:02d}s"
+        if m:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    print(f"\033[1;34m==>\033[0m Session \033[1m{sess_id}\033[0m (\033[1m{name}\033[0m)")
+    print(f"  \033[1mStatus:\033[0m    {status}")
+    print(f"  \033[1mSubstrate:\033[0m {substrate}")
+    print(f"  \033[1mProfile:\033[0m   {profile_name}")
+    print()
+    print(f"  \033[1mCreated:\033[0m       {fmt_ts(sess.get('created_at'))}")
+    print(f"  \033[1mStarted:\033[0m       {fmt_ts(sess.get('started_at'))}")
+    print(f"  \033[1mUptime:\033[0m        {fmt_duration(sess['uptime_seconds'])}")
+    print(f"  \033[1mHard limit:\033[0m    {fmt_duration(sess['max_duration_seconds'])}")
+    print(f"  \033[1mRemaining:\033[0m     {fmt_duration(sess['remaining_seconds'])}")
+    print()
+    daily_used = profile["daily_usage_seconds"]
+    daily_cap = daily_used + profile["remaining_daily_seconds"]
+    print(f"  \033[1mAccount:\033[0m       {profile['email']} | Tier: {profile['tier'].upper()}")
+    print(f"  \033[1mDaily usage:\033[0m   {fmt_duration(daily_used)} used / {fmt_duration(daily_cap)} cap")
+
+
 def cmd_verify(args: argparse.Namespace) -> None:
     """Inspect or run automated PR verification."""
     pr_num = args.pr
@@ -431,6 +557,18 @@ def main() -> None:
     # Logout
     p_logout = sub.add_parser("logout", help="Remove stored credentials (local logout)")
     p_logout.set_defaults(func=cmd_logout)
+
+    # Open — re-launch the browser for an existing session
+    p_open = sub.add_parser("open", help="Re-open the noVNC viewer for a running session in the browser")
+    p_open.add_argument("session_id", nargs="?", help="Session ID to open (defaults to most-recent running session)")
+    p_open.add_argument("--print-only", action="store_true",
+                        help="Print the web URL instead of launching a browser (CI-friendly)")
+    p_open.set_defaults(func=cmd_open)
+
+    # Logs — show duration accounting for a session
+    p_logs = sub.add_parser("logs", help="Show duration accounting and lifecycle timestamps for a session")
+    p_logs.add_argument("session_id", nargs="?", help="Session ID to inspect (defaults to most-recent)")
+    p_logs.set_defaults(func=cmd_logs)
 
     args = parser.parse_args()
     args.func(args)
