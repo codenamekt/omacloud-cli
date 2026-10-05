@@ -21,6 +21,8 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+__version__ = "0.2.0"
+
 CONFIG_DIR = Path.home() / ".config" / "omacloud"
 AUTH_FILE = CONFIG_DIR / "auth.json"
 API_BASE_URL = os.environ.get("OMACLOUD_API_URL", "https://api.omacloud.org/v1")
@@ -520,6 +522,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="omacloud",
         description="OmaCloud CLI — Launch ephemeral Omarchy desktops and verify PRs.",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show program's version number and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
